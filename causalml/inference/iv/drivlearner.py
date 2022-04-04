@@ -11,8 +11,9 @@ from causalml.inference.meta.utils import (
 )
 from causalml.metrics import regression_metrics, classification_metrics
 from causalml.propensity import compute_propensity_score
+from pygam import LogisticGAM, s
 from scipy.stats import norm
-from sklearn.model_selection import cross_val_predict, KFold
+from sklearn.model_selection import cross_val_predict, KFold, StratifiedKFold
 from tqdm import tqdm
 from xgboost import XGBRegressor
 
@@ -878,3 +879,339 @@ class XGBDRIVRegressor(BaseDRIVRegressor):
             ate_alpha=ate_alpha,
             control_name=control_name,
         )
+
+
+class XGBDRIVClassifier(BaseDRIVLearner):
+    """A parent class for DRIV-learner regressor classes.
+
+    A DRIV-learner estimates endogenous treatment effects for compliers with machine learning models.
+
+    Details of DR-learner are available at Kennedy (2020) (https://arxiv.org/abs/2004.14497).
+    The DR moment condition for LATE comes from Chernozhukov et al (2018) (https://academic.oup.com/ectj/article/21/1/C1/5056401).
+    """
+
+    def __init__(
+        self,
+        control_outcome_learner=None,
+        treatment_outcome_learner=None,
+        treatment_effect_learner=None,
+        ate_alpha=0.05,
+        control_name=0,
+        cv=3,
+        random_state=2,
+        control_outcome_learner_eval_metric='auc',
+        treatment_outcome_learner_eval_metric='auc',
+        effect_learner_eval_metric='rms',
+        control_outcome_learner_early_stopping_rounds=10,
+        treatment_outcome_learner_early_stopping_rounds=10,
+        effect_learner_early_stopping_rounds=10,
+    ):
+        """Initialize a DR-learner.
+
+        Args:
+            learner (optional): a model to estimate outcomes and treatment effects in both the control and treatment
+                groups
+            control_outcome_learner (optional): a model to estimate outcomes in the control group
+            treatment_outcome_learner (optional): a model to estimate outcomes in the treatment group
+            treatment_effect_learner (optional): a model to estimate treatment effects in the treatment group. It needs
+                to take `sample_weight` as an input argument in `fit()`.
+            ate_alpha (float, optional): the confidence level alpha of the ATE estimate
+            control_name (str or int, optional): name of control group
+        """
+        assert (
+            (control_outcome_learner is not None)
+            and (treatment_outcome_learner is not None)
+            and (treatment_effect_learner is not None)
+        )
+        super().__init__(
+            learner=None,
+            control_outcome_learner=control_outcome_learner,
+            treatment_outcome_learner=treatment_outcome_learner,
+            treatment_effect_learner=treatment_effect_learner,
+            ate_alpha=ate_alpha,
+            control_name=control_name,
+        )
+        self.n_folds = cv
+        self.random_state = random_state
+
+        self.model_mu_c = control_outcome_learner
+        self.model_mu_t = treatment_outcome_learner
+        self.model_tau = treatment_effect_learner
+
+        self.ate_alpha = ate_alpha
+        self.control_name = control_name
+
+        self.control_outcome_learner_early_stopping_rounds = control_outcome_learner_early_stopping_rounds
+        self.treatment_outcome_learner_early_stopping_rounds = treatment_outcome_learner_early_stopping_rounds
+        self.effect_learner_early_stopping_rounds = effect_learner_early_stopping_rounds
+        self.control_outcome_learner_eval_metric = control_outcome_learner_eval_metric
+        self.treatment_outcome_learner_eval_metric = treatment_outcome_learner_eval_metric
+        self.effect_learner_eval_metric = effect_learner_eval_metric
+
+    def __repr__(self):
+        return (
+            "{}(control_outcome_learner={},\n"
+            "\ttreatment_outcome_learner={},\n"
+            "\ttreatment_effect_learner={})".format(
+                self.__class__.__name__,
+                self.model_mu_c.__repr__(),
+                self.model_mu_t.__repr__(),
+                self.model_tau.__repr__(),
+            )
+        )
+
+    def fit(self, X, assignment, treatment, y, p=None, pZ=None,
+            val_X=None, val_assignment=None, val_treatment=None, val_y=None, val_p=None, val_pZ=None,
+            verbose=False):
+        """Fit the inference model.
+
+        Args:
+            X (np.matrix or np.array or pd.Dataframe): a feature matrix
+            assignment (np.array or pd.Series): a (0,1)-valued assignment vector. The assignment is the
+                instrumental variable that does not depend on unknown confounders. The assignment status
+                influences treatment in a monotonic way, i.e. one can only be more likely to take the
+                treatment if assigned.
+            treatment (np.array or pd.Series): a treatment vector
+            y (np.array or pd.Series): an outcome vector
+            p (2-tuple of np.ndarray or pd.Series or dict, optional): The first (second) element corresponds to
+                unassigned (assigned) units. Each is an array of propensity scores of float (0,1) in the single-treatment
+                case; or, a dictionary of treatment groups that map to propensity vectors of float (0,1). If None will run
+                ElasticNetPropensityModel() to generate the propensity scores.
+            pZ (np.array or pd.Series, optional): an array of assignment probability of float (0,1); if None
+                will run ElasticNetPropensityModel() to generate the assignment probability score.
+            seed (int): random seed for cross-fitting
+        """
+        X, treatment, assignment, y = convert_pd_to_np(X, treatment, assignment, y)
+        check_treatment_vector(treatment, self.control_name)
+        self.t_groups = np.unique(treatment[treatment != self.control_name])
+        self.t_groups.sort()
+        self._classes = {group: i for i, group in enumerate(self.t_groups)}
+
+        # The estimator splits the data into 3 partitions for cross-fit on the propensity score estimation,
+        # the outcome regression, and the treatment regression on the doubly robust estimates. The use of
+        # the partitions is rotated so we do not lose on the sample size.  We do not cross-fit the assignment
+        # score estimation as the assignment process is usually simple.
+        cv = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_state)
+
+        self.models_mu_c = {
+            group: [deepcopy(self.model_mu_c) for _ in range(self.n_folds)]
+            for group in self.t_groups
+        }
+        self.models_mu_t = {
+            group: [deepcopy(self.model_mu_t) for _ in range(self.n_folds)]
+            for group in self.t_groups
+        }
+        self.models_tau = {
+            group: [deepcopy(self.model_tau) for _ in range(self.n_folds)]
+            for group in self.t_groups
+        }
+
+        self.calibraters_c = {
+            group: [LogisticGAM(s(0)) for _ in range(self.n_folds)]
+            for group in self.t_groups
+        }
+
+        self.calibraters_t = {
+            group: [LogisticGAM(s(0)) for _ in range(self.n_folds)]
+            for group in self.t_groups
+        }
+
+        for ifold, (outcome_idx, tau_idx) in enumerate(cv.split(X, y)):
+            treatment_out, treatment_tau = (
+                treatment[outcome_idx],
+                treatment[tau_idx],
+            )
+            assignment_out, assignment_tau = (
+                assignment[outcome_idx],
+                assignment[tau_idx],
+            )
+            y_out, y_tau = y[outcome_idx], y[tau_idx]
+            X_out, X_tau = X[outcome_idx], X[tau_idx]
+            pZ_tau = pZ[tau_idx]
+
+            if isinstance(p[0], (np.ndarray, pd.Series)):
+                cur_p_0 = {self.t_groups[0]: convert_pd_to_np(p[0][tau_idx])}
+            else:
+                cur_p_0 = {g: prop[tau_idx] for g, prop in p[0].items()}
+
+            if isinstance(p[1], (np.ndarray, pd.Series)):
+                cur_p_1 = {self.t_groups[0]: convert_pd_to_np(p[1][tau_idx])}
+            else:
+                cur_p_1 = {g: prop[tau_idx] for g, prop in p[1].items()}
+
+            logger.info("Generate outcome regressions")
+            for group in self.t_groups:
+                mask = (treatment_out == group) | (treatment_out == self.control_name)
+                mask_1, mask_0 = mask & (assignment_out == 1), mask & (assignment_out == 0)
+                if not ((val_X is not None) and (self.control_outcome_learner_early_stopping_rounds > 0) \
+                        and (self.treatment_outcome_learner_early_stopping_rounds > 0)):
+                    self.models_mu_c[group][ifold].fit(X_out[mask_0], y_out[mask_0])
+                    self.models_mu_t[group][ifold].fit(X_out[mask_1], y_out[mask_1])
+                else:
+                    val_mask = (val_treatment == group) | (val_treatment == self.control_name)
+                    val_mask_1, val_mask_0 = val_mask & (val_assignment == 1), val_mask & (val_assignment == 0)
+                    self.models_mu_c[group][ifold].fit(X_out[mask_0], y_out[mask_0],
+                                                       eval_set=[(val_X[val_mask_0], val_y[val_mask_0])],
+                                                       eval_metric=self.control_outcome_learner_eval_metric,
+                                                       early_stopping_rounds=self.control_outcome_learner_early_stopping_rounds,
+                                                       verbose=verbose)
+                    self.models_mu_t[group][ifold].fit(X_out[mask_1], y_out[mask_1],
+                                                       eval_set=[(val_X[val_mask_1], val_y[val_mask_1])],
+                                                       eval_metric=self.treatment_outcome_learner_eval_metric,
+                                                       early_stopping_rounds=self.treatment_outcome_learner_early_stopping_rounds,
+                                                       verbose=verbose)
+                mask = (treatment_tau == group) | (treatment_tau == self.control_name)
+                pred = self.models_mu_c[group][ifold].predict_proba(X_tau[mask],
+                                                                    iteration_range=(0, self.models_mu_c[group][ifold].best_ntree_limit))[:, 1]
+                gam = self.calibraters_c[group][ifold].fit(pred, y_tau[mask])
+                self.calibraters_c[group][ifold] = gam
+                pred = self.models_mu_t[group][ifold].predict_proba(X_tau[mask],
+                                                                    iteration_range=(0, self.models_mu_t[group][ifold].best_ntree_limit))[:, 1]
+                gam = self.calibraters_t[group][ifold].fit(pred, y_tau[mask])
+                self.calibraters_t[group][ifold] = gam
+
+            logger.info("Fit pseudo outcomes from the DR formula")
+            for group in self.t_groups:
+                mask = (treatment_tau == group) | (treatment_tau == self.control_name)
+                treatment_filt = treatment_tau[mask]
+                X_filt = X_tau[mask]
+                y_filt = y_tau[mask]
+                w_filt = (treatment_filt == group).astype(int)
+                p_1_filt = cur_p_1[group][mask]
+                p_0_filt = cur_p_0[group][mask]
+                z_filt = assignment_tau[mask]
+                pZ_filt = pZ_tau[mask]
+                mu_t = self.models_mu_t[group][ifold].predict_proba(X_filt,
+                                                                    iteration_range=(0, self.models_mu_t[group][ifold].best_ntree_limit))[:, 1]
+                mu_t = self.calibraters_t[group][ifold].predict_proba(mu_t)
+                mu_c = self.models_mu_c[group][ifold].predict_proba(X_filt,
+                                                                    iteration_range=(0, self.models_mu_c[group][ifold].best_ntree_limit))[:, 1]
+                mu_c = self.calibraters_c[group][ifold].predict_proba(mu_c)
+                dr = (
+                    z_filt * (y_filt - mu_t) / pZ_filt
+                    - (1 - z_filt) * (y_filt - mu_c) / (1 - pZ_filt)
+                    + mu_t
+                    - mu_c
+                )
+                weight = (
+                    z_filt * (w_filt - p_1_filt) / pZ_filt
+                    - (1 - z_filt) * (w_filt - p_0_filt) / (1 - pZ_filt)
+                    + p_1_filt
+                    - p_0_filt
+                )
+                dr /= weight
+                if not ((val_X is not None) and (self.effect_learner_early_stopping_rounds > 0)):
+                    self.models_tau[group][ifold].fit(X_filt, dr, sample_weight=weight ** 2)
+                else:
+                    val_mask = (val_treatment == group) | (val_treatment == self.control_name)
+                    val_treatment_filt = val_treatment[val_mask]
+                    val_X_filt = val_X[val_mask]
+                    val_y_filt = val_y[val_mask]
+                    val_w_filt = (val_treatment_filt == group).astype(int)
+                    if isinstance(val_p[0], (np.ndarray, pd.Series)):
+                        val_cur_p_0 = {self.t_groups[0]: convert_pd_to_np(val_p[0])}
+                    else:
+                        val_cur_p_0 = val_p[0]
+                    if isinstance(val_p[1], (np.ndarray, pd.Series)):
+                        val_cur_p_1 = {self.t_groups[0]: convert_pd_to_np(val_p[1])}
+                    else:
+                        val_cur_p_1 = val_p[1]
+                    val_p_1_filt = val_cur_p_1[group][val_mask]
+                    val_p_0_filt = val_cur_p_0[group][val_mask]
+                    val_z_filt = val_assignment[val_mask]
+                    val_pZ_filt = val_pZ[val_mask]
+                    val_mu_t = self.models_mu_t[group][ifold].predict_proba(val_X_filt,
+                                                                            iteration_range=(0, self.models_mu_t[group][ifold].best_ntree_limit))[:, 1]
+                    val_mu_t = self.calibraters_t[group][ifold].predict_proba(val_mu_t)
+                    val_mu_c = self.models_mu_c[group][ifold].predict_proba(val_X_filt,
+                                                                            iteration_range=(0, self.models_mu_c[group][ifold].best_ntree_limit))[:, 1]
+                    val_mu_c = self.calibraters_c[group][ifold].predict_proba(val_mu_c)
+                    val_dr = (
+                            val_z_filt * (val_y_filt - val_mu_t) / val_pZ_filt
+                            - (1 - val_z_filt) * (val_y_filt - val_mu_c) / (1 - val_pZ_filt)
+                            + val_mu_t
+                            - val_mu_c
+                    )
+                    val_weight = (
+                            val_z_filt * (val_w_filt - val_p_1_filt) / val_pZ_filt
+                            - (1 - val_z_filt) * (val_w_filt - val_p_0_filt) / (1 - val_pZ_filt)
+                            + val_p_1_filt
+                            - val_p_0_filt
+                    )
+                    val_dr /= val_weight
+                    self.models_tau[group][ifold].fit(X_filt, dr,
+                                                      sample_weight=weight ** 2,
+                                                      eval_set=[(val_X_filt, val_dr)],
+                                                      sample_weight_eval_set=[val_weight ** 2],
+                                                      eval_metric=self.effect_learner_eval_metric,
+                                                      early_stopping_rounds=self.effect_learner_early_stopping_rounds,
+                                                      verbose=verbose
+                                                      )
+
+    def predict_control_outcome(self, X, group):
+        n_folds = len(self.models_mu_c[group])
+        mu_c = np.zeros((X.shape[0], n_folds))
+        for ifold in range(len(self.models_mu_c[group])):
+            temp = self.models_mu_c[group][ifold].predict_proba(
+                X, iteration_range=(0, self.models_mu_c[group][ifold].best_ntree_limit))[:, 1]
+            mu_c[:, ifold] = self.calibraters_c[group][ifold].predict_proba(temp)
+        return mu_c.mean(axis=1)
+
+    def predict_treatment_outcome(self, X, group):
+        n_folds = len(self.models_mu_t[group])
+        mu_t = np.zeros((X.shape[0], n_folds))
+        for ifold in range(len(self.models_mu_t[group])):
+            temp = self.models_mu_t[group][ifold].predict_proba(
+                X, iteration_range=(0, self.models_mu_t[group][ifold].best_ntree_limit))[:, 1]
+            mu_t[:, ifold] = self.calibraters_t[group][ifold].predict_proba(temp)
+        return mu_t.mean(axis=1)
+
+    def predict(self, X, treatment=None, y=None, return_components=False, verbose=True):
+        """Predict treatment effects.
+        Args:
+            X (np.matrix or np.array or pd.Dataframe): a feature matrix
+            treatment (np.array or pd.Series, optional): a treatment vector
+            y (np.array or pd.Series, optional): an outcome vector
+            verbose (bool, optional): whether to output progress logs
+        Returns:
+            (numpy.ndarray): Predictions of treatment effects for compliers, i.e. those individuals
+                who take the treatment only if they are assigned.
+        """
+        X, treatment, y = convert_pd_to_np(X, treatment, y)
+
+        te = np.zeros((X.shape[0], self.t_groups.shape[0]))
+        yhat_cs = {}
+        yhat_ts = {}
+
+        for i, group in enumerate(self.t_groups):
+            models_tau = self.models_tau[group]
+            _te = np.r_[[model.predict(X, iteration_range=(0, model.best_ntree_limit)) for model in models_tau]].mean(axis=0)
+            te[:, i] = np.ravel(_te)
+            yhat_cs[group] = self.predict_control_outcome(X, group)
+            yhat_ts[group] = self.predict_treatment_outcome(X, group)
+
+            if (y is not None) and (treatment is not None) and verbose:
+                mask = (treatment == group) | (treatment == self.control_name)
+                treatment_filt = treatment[mask]
+                y_filt = y[mask]
+                w = (treatment_filt == group).astype(int)
+
+                yhat = np.zeros_like(y_filt, dtype=float)
+                yhat[w == 0] = yhat_cs[group][mask][w == 0]
+                yhat[w == 1] = yhat_ts[group][mask][w == 1]
+
+                logger.info("Error metrics for group {}".format(group))
+                classification_metrics(y_filt, yhat, w)
+
+        if not return_components:
+            return te
+        else:
+            return te, yhat_cs, yhat_ts
+
+    def estimate_ate(self, X):
+        te, _, _ = self.predict(X, return_components=True)
+        ate = np.zeros(self.t_groups.shape[0])
+        for i, group in enumerate(self.t_groups):
+            _ate = te[:, i].mean()
+            ate[i] = _ate
+        return ate

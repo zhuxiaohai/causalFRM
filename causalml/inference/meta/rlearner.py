@@ -4,8 +4,9 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from scipy.stats import norm
-from sklearn.model_selection import cross_val_predict, KFold, train_test_split
+from sklearn.model_selection import cross_val_predict, KFold, StratifiedKFold, train_test_split
 from xgboost import XGBRegressor
+from pygam import LogisticGAM, s
 
 from causalml.inference.meta.base import BaseLearner
 from causalml.inference.meta.utils import (
@@ -13,6 +14,7 @@ from causalml.inference.meta.utils import (
     get_xgboost_objective_metric,
     convert_pd_to_np,
     get_weighted_variance,
+    check_p_conditions
 )
 from causalml.inference.meta.explainer import Explainer
 from causalml.propensity import compute_propensity_score, ElasticNetPropensityModel
@@ -676,3 +678,221 @@ class XGBRRegressor(BaseRRegressor):
             sample_weight_filt_t = sample_weight_filt[w == 1]
             self.vars_c[group] = get_weighted_variance(diff_c, sample_weight_filt_c)
             self.vars_t[group] = get_weighted_variance(diff_t, sample_weight_filt_t)
+
+
+class XGBRClassifier(object):
+    def __init__(self,
+                 outcome_learner,
+                 effect_learner,
+                 control_name,
+                 cv=3,
+                 ate_alpha=0.05,
+                 outcome_learner_eval_metric='auc',
+                 outcome_learner_early_stopping_rounds=30,
+                 effect_learner_eval_metric='rms',
+                 effect_learner_early_stopping_rounds=30,
+                 random_state=42):
+        """Initialize an R-learner regressor with XGBoost model using pairwise ranking objective.
+
+        Args:
+            early_stopping: whether or not to use early stopping when fitting effect learner
+            test_size (float, optional): the proportion of the dataset to use as validation set when early stopping is
+                                         enabled
+            early_stopping_rounds (int, optional): validation metric needs to improve at least once in every
+                                                   early_stopping_rounds round(s) to continue training
+            effect_learner_n_estimators (int, optional): number of trees to fit for the effect learner (default = 500)
+        """
+
+        assert isinstance(random_state, int), 'random_state should be int.'
+        self.model_mu = deepcopy(outcome_learner)
+        self.model_tau = deepcopy(effect_learner)
+        self.cv = cv
+        self.ate_alpha = ate_alpha
+        self.control_name = control_name
+        self.random_state = random_state
+        self.outcome_learner_early_stopping_rounds = outcome_learner_early_stopping_rounds
+        self.effect_learner_early_stopping_rounds = effect_learner_early_stopping_rounds
+        self.outcome_learner_eval_metric = outcome_learner_eval_metric
+        self.effect_learner_eval_metric = effect_learner_eval_metric
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}\n'
+                f'\toutcome_learner={self.model_mu.__repr__()}\n'
+                f'\teffect_learner={self.model_tau.__repr__()}\n')
+
+    @staticmethod
+    def _format_p(p, t_groups):
+        """Format propensity scores into a dictionary of {treatment group: propensity scores}.
+
+        Args:
+            p (np.ndarray, pd.Series, or dict): propensity scores
+            t_groups (list): treatment group names.
+
+        Returns:
+            dict of {treatment group: propensity scores}
+        """
+        check_p_conditions(p, t_groups)
+
+        if isinstance(p, (np.ndarray, pd.Series)):
+            treatment_name = t_groups[0]
+            p = {treatment_name: convert_pd_to_np(p)}
+        elif isinstance(p, dict):
+            p = {treatment_name: convert_pd_to_np(_p) for treatment_name, _p in p.items()}
+
+        return p
+
+    def predict_outcome(self, X):
+        outcome = np.zeros((X.shape[0], self.cv))
+        for i in range(self.cv):
+            pred = self.models_mu[i].predict_proba(X, ntree_limit=self.models_mu[i].best_ntree_limit)[:, 1]
+            pred = self.calibraters[i].predict_proba(pred)
+            outcome[:, i] = pred
+        return outcome.mean(axis=1)
+
+    def fit(self, X, treatment, y, p=None, val_X=None, val_treatment=None, val_y=None, val_p=None, verbose=True):
+        """Fit the treatment effect and outcome models of the R learner.
+
+        Args:
+            X (np.matrix or np.array or pd.Dataframe): a feature matrix
+            y (np.array or pd.Series): an outcome vector
+            p (np.ndarray or pd.Series or dict, optional): an array of propensity scores of float (0,1) in the
+                single-treatment case; or, a dictionary of treatment groups that map to propensity vectors of
+                float (0,1); if None will run ElasticNetPropensityModel() to generate the propensity scores.
+            verbose (bool, optional): whether to output progress logs
+        """
+        X, treatment, y = convert_pd_to_np(X, treatment, y)
+        check_treatment_vector(treatment, self.control_name)
+        self.t_groups = np.unique(treatment[treatment != self.control_name])
+        self.t_groups.sort()
+
+        p = self._format_p(p, self.t_groups)
+
+        self._classes = {group: i for i, group in enumerate(self.t_groups)}
+        self.models_mu = {i: deepcopy(self.model_mu) for i in range(self.cv)}
+        self.models_tau = {group: deepcopy(self.model_tau) for group in self.t_groups}
+        self.calibraters = {}
+        self.vars_c = {}
+        self.vars_t = {}
+
+        if verbose:
+            logger.info('generating out-of-fold CV outcome estimates')
+        folds = StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
+        yhat = np.zeros(y.shape[0])
+        for i, (train_index, test_index) in enumerate(folds.split(X, y)):
+            X_train, X_test = X[train_index], X[test_index]
+            y_train, y_test = y[train_index], y[test_index]
+            if (val_X is not None) and (self.outcome_learner_early_stopping_rounds > 0):
+                self.models_mu[i].fit(X_train, y_train,
+                                      eval_set=[(val_X, val_y)],
+                                      eval_metric=self.outcome_learner_eval_metric,
+                                      early_stopping_rounds=self.outcome_learner_early_stopping_rounds,
+                                      verbose=verbose)
+            else:
+                self.models_mu[i].fit(X_train, y_train,
+                                      eval_metric=self.outcome_learner_eval_metric,
+                                      verbose=verbose)
+            pred = self.models_mu[i].predict_proba(X_test, ntree_limit=self.models_mu[i].best_ntree_limit)[:, 1]
+            gam = LogisticGAM(s(0)).fit(pred, y_test)
+            pred = gam.predict_proba(pred)
+            self.calibraters[i] = gam
+            yhat[test_index] = pred
+
+        for group in self.t_groups:
+            treatment_mask = (treatment == group) | (treatment == self.control_name)
+            treatment_filt = treatment[treatment_mask]
+            w = (treatment_filt == group).astype(int)
+
+            X_filt = X[treatment_mask]
+            y_filt = y[treatment_mask]
+            yhat_filt = yhat[treatment_mask]
+            p_filt = p[group][treatment_mask]
+
+            if verbose:
+                logger.info('training the treatment effect model for {} with R-loss'.format(group))
+
+            if (val_X is not None) and (self.effect_learner_early_stopping_rounds > 0):
+                val_yhat = self.predict_outcome(val_X)
+                val_p = self._format_p(val_p, self.t_groups)
+                val_treatment_mask = (val_treatment == group) | (val_treatment == self.control_name)
+                val_treatment_filt = val_treatment[val_treatment_mask]
+                val_w = (val_treatment_filt == group).astype(int)
+                val_X_filt = val_X[val_treatment_mask]
+                val_y_filt = val_y[val_treatment_mask]
+                val_yhat_filt = val_yhat[val_treatment_mask]
+                val_p_filt = val_p[group][val_treatment_mask]
+
+                self.models_tau[group].fit(X=X_filt,
+                                           y=(y_filt - yhat_filt) / (w - p_filt),
+                                           sample_weight=(w - p_filt) ** 2,
+                                           eval_set=[(val_X_filt,
+                                                      (val_y_filt - val_yhat_filt) / (val_w - val_p_filt))],
+                                           sample_weight_eval_set=[(val_w - val_p_filt) ** 2],
+                                           eval_metric=self.effect_learner_eval_metric,
+                                           early_stopping_rounds=self.effect_learner_early_stopping_rounds,
+                                           verbose=verbose)
+
+            else:
+                self.models_tau[group].fit(X_filt, (y_filt - yhat_filt) / (w - p_filt),
+                                           sample_weight=(w - p_filt) ** 2,
+                                           eval_metric=self.effect_learner_eval_metric)
+
+            self.vars_c[group] = (y_filt[w == 0] - yhat_filt[w == 0]).var()
+            self.vars_t[group] = (y_filt[w == 1] - yhat_filt[w == 1]).var()
+
+    def predict(self, X):
+        """Predict treatment effects.
+
+        Args:
+            X (np.matrix or np.array or pd.Dataframe): a feature matrix
+
+        Returns:
+            (numpy.ndarray): Predictions of treatment effects.
+        """
+        X = convert_pd_to_np(X)
+        te = np.zeros((X.shape[0], self.t_groups.shape[0]))
+        for i, group in enumerate(self.t_groups):
+            dhat = self.models_tau[group].predict(X, ntree_limit=self.models_tau[group].best_ntree_limit)
+            te[:, i] = dhat
+        return te
+
+    def estimate_ate(self, X, treatment, y):
+        """Estimate the Average Treatment Effect (ATE).
+
+        Args:
+            X (np.matrix or np.array or pd.Dataframe): a feature matrix
+            treatment (np.array or pd.Series): a treatment vector
+            y (np.array or pd.Series): an outcome vector
+            p (np.ndarray or pd.Series or dict, optional): an array of propensity scores of float (0,1) in the
+                single-treatment case; or, a dictionary of treatment groups that map to propensity vectors of
+                float (0,1); if None will run ElasticNetPropensityModel() to generate the propensity scores.
+            bootstrap_ci (bool): whether run bootstrap for confidence intervals
+            n_bootstraps (int): number of bootstrap iterations
+            bootstrap_size (int): number of samples per bootstrap
+        Returns:
+            The mean and confidence interval (LB, UB) of the ATE estimate.
+        """
+        X, treatment, y = convert_pd_to_np(X, treatment, y)
+        te = self.predict(X)
+
+        ate = np.zeros(self.t_groups.shape[0])
+        ate_lb = np.zeros(self.t_groups.shape[0])
+        ate_ub = np.zeros(self.t_groups.shape[0])
+
+        for i, group in enumerate(self.t_groups):
+            w = (treatment == group).astype(int)
+            prob_treatment = float(sum(w)) / X.shape[0]
+            _ate = te[:, i].mean()
+
+            se = (np.sqrt((self.vars_t[group] / prob_treatment)
+                          + (self.vars_c[group] / (1 - prob_treatment))
+                          + te[:, i].var())
+                  / X.shape[0])
+
+            _ate_lb = _ate - se * norm.ppf(1 - self.ate_alpha / 2)
+            _ate_ub = _ate + se * norm.ppf(1 - self.ate_alpha / 2)
+
+            ate[i] = _ate
+            ate_lb[i] = _ate_lb
+            ate_ub[i] = _ate_ub
+
+        return ate, ate_lb, ate_ub

@@ -28,10 +28,12 @@ from causalml.inference.meta import (
     BaseRClassifier,
     BaseRRegressor,
     XGBRRegressor,
+    XGBRClassifier,
 )
 from causalml.inference.meta import TMLELearner
 from causalml.inference.meta import BaseDRLearner
-from causalml.metrics import ape, get_cumgain
+from causalml.metrics import ape, get_cumgain, auuc_score
+from causalml.tuner import OptunaSearch
 
 from .const import RANDOM_SEED, N_SAMPLE, ERROR_THRESHOLD, CONTROL_NAME, CONVERSION
 
@@ -923,3 +925,91 @@ def test_BaseDRLearner(generate_regression_data):
     # Check if the cumulative gain when using the model's prediction is
     # higher than it would be under random targeting
     assert cumgain["cate_p"].sum() > cumgain["Random"].sum()
+
+
+def test_XGBRClassifier(generate_classification_data_two_treatments):
+    df, x_names = generate_classification_data_two_treatments()
+    train_data, val_data = train_test_split(df, test_size=0.2, random_state=0)
+    train_data['p'] = 0.5
+    val_data['p'] = 0.5
+
+    class Wrapper(XGBRClassifier):
+        def __init__(self, x_cols, treatment_col, y_col, *args, **kargs):
+            outcome_learner_param_dict = {'booster': 'gbtree',
+                                          'objective': "binary:logistic",
+                                          'n_estimators': 1000,
+                                          'n_jobs': -1,
+                                          'random_state': 5,
+                                          'max_depth': 3,
+                                          'reg_lambda': 5,
+                                          'reg_alpha': 2,
+                                          'gamma': 1,
+                                          'min_child_weight': 5,
+                                          'base_score': 0.5,
+                                          'colsample_bytree': 0.6,
+                                          'colsample_bylevel': 0.6,
+                                          'colsample_bynode': 0.6,
+                                          'subsample': 0.6,
+                                          'learning_rate': 0.5
+                                          }
+            super().__init__(outcome_learner=XGBClassifier(**outcome_learner_param_dict),
+                             effect_learner=XGBRegressor(*args, **kargs),
+                             control_name='control',
+                             outcome_learner_eval_metric='auc',
+                             effect_learner_eval_metric='rmse',
+                             outcome_learner_early_stopping_rounds=5,
+                             effect_learner_early_stopping_rounds=5
+                             )
+            self.x_cols = x_cols
+            self.treatment_col = treatment_col
+            self.y_col = y_col
+
+        def score(self, X, y=None):
+            auuc = auuc_score(X[[self.y_col, self.treatment_col]].assign(
+                pred=self.predict(X[self.x_cols].values).max(axis=1),
+                if_treat=(X[self.treatment_col] != self.control_name).astype(int).values),
+                outcome_col=self.y_col,
+                treatment_col='if_treat',
+                normalize=True).loc['pred']
+            return auuc
+
+        def fit(self, X, treatment=None, y=None, **kwargs):
+            super().fit(X[self.x_cols].values, X[self.treatment_col].values, X[self.y_col].values, **kwargs)
+
+    op = OptunaSearch(n_startup_trials=1, n_warmup_steps=1, n_trials=5, optuna_njobs=-1)
+
+    tuning_param_dict = {'x_cols': x_names,
+                         'y_col': 'conversion',
+                         'treatment_col': 'treatment_group_key',
+                         'booster': 'gbtree',
+                         'n_estimators': 1000,
+                         'n_jobs': -1,
+                         'random_state': 5,
+                         'objective': "reg:squarederror",
+                         'max_depth': ('int', {'low': 2, 'high': 6}),
+                         'reg_lambda': ('int', {'low': 1, 'high': 20}),
+                         'reg_alpha': ('int', {'low': 1, 'high': 20}),
+                         'gamma': ('int', {'low': 0, 'high': 3}),
+                         'min_child_weight': ('int', {'low': 1, 'high': 30}),
+                         'base_score': ('discrete_uniform', {'low': 0.5, 'high': 0.9, 'q': 0.1}),
+                         'colsample_bytree': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'colsample_bylevel': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'colsample_bynode': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'subsample': ('discrete_uniform', {'low': 0.7, 'high': 1, 'q': 0.05}),
+                         'learning_rate': ('discrete_uniform', {'low': 0.07, 'high': 1.2, 'q': 0.01})
+                         }
+
+    fit_params = {'p': train_data['p'].values,
+                  'val_X': val_data[x_names].values,
+                  'val_treatment': val_data['treatment_group_key'].values,
+                  'val_y': val_data['conversion'].values,
+                  'val_p': val_data['p'].values,
+                  'verbose': False}
+
+    op.search(Wrapper, tuning_param_dict, train_data, val_data, **fit_params)
+
+    train_param = op.get_params()
+    print(train_param)
+    a = Wrapper(**train_param[0])
+    a.fit(train_data, **fit_params)
+    print(a.score(val_data))

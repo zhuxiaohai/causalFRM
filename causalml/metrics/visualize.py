@@ -1016,3 +1016,30 @@ def _get_wmean_wvar(X, weight):
     ) * (np.sum(weight * np.power((X - weighted_mean), 2)))
 
     return [weighted_mean, weighted_var]
+
+
+def get_expected_outcome(df, outcome_col='y', treatment_col='w', pred_assignment='pred_assignment'):
+    assert (outcome_col in df.columns) and (treatment_col in df.columns) and (pred_assignment in df.columns)
+    df = df.copy()
+    df['expeceted_outcome'] = 0.0
+    for t in df[treatment_col].unique():
+        propensity_score = (df[treatment_col] == t).mean()
+        df.loc[df[pred_assignment] == t, 'expected_outcome'] = \
+            df.loc[df[pred_assignment] == t, outcome_col] / propensity_score
+    return df['expected_outcome'].mean()
+
+
+def get_modified_upliftcurve(df, outcome_col='y', treatment_col='w', pred_assignment='pred_assignment',
+                             control_name='control', max_uplift_col='max_uplift', quantiles=10):
+    df = df.copy()
+    df = df.sort_values(max_uplift_col, ascending=False).reset_index(drop=True)
+    n_th = int(df.shape[0] / quantiles)
+    modified_uplift = []
+    for i in range(quantiles):
+        df.iloc[i * n_th:]['temp_assignment'] = control_name
+        expected_outcome = get_expected_outcome(df, outcome_col, treatment_col, 'temp_assignment')
+        modified_uplift.append(expected_outcome)
+        df['temp_assignment'] = df[pred_assignment]
+    expected_outcome = get_expected_outcome(df, outcome_col, treatment_col, 'temp_assignment')
+    modified_uplift.append(expected_outcome)
+    return modified_uplift

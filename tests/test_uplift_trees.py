@@ -7,7 +7,8 @@ from joblib import parallel_backend
 from sklearn.model_selection import train_test_split
 
 from causalml.inference.tree import UpliftTreeClassifier, UpliftRandomForestClassifier
-from causalml.metrics import get_cumgain
+from causalml.metrics import get_cumgain, auuc_score
+from causalml.tuner import OptunaSearch
 
 from .const import RANDOM_SEED, N_SAMPLE, CONTROL_NAME, TREATMENT_NAMES, CONVERSION
 
@@ -205,3 +206,43 @@ def test_UpliftTreeClassifier_feature_importance(generate_classification_data):
     # would evaluate the same feature, thus the number of features with importance value
     # shouldn't be larger than the number of non-leaf node
     assert num_non_zero_imp_features <= num_non_leaf_nodes
+
+
+def test_UpliftForestClassifier_Optuna(generate_classification_data_two_treatments):
+    class Wrapper(UpliftRandomForestClassifier):
+        def __init__(self, x_cols, treatment_col, y_col, *args, **kargs):
+            super().__init__(*args, **kargs)
+            self.x_cols = x_cols
+            self.treatment_col = treatment_col
+            self.y_col = y_col
+
+        def score(self, X, y=None):
+            auuc = auuc_score(X[[self.y_col, self.treatment_col]].assign(
+                pred=self.predict(X[self.x_cols].values).max(axis=1),
+                if_treat=(X[self.treatment_col] != self.control_name).astype(int).values),
+                outcome_col=self.y_col,
+                treatment_col='if_treat',
+                normalize=True).loc['pred']
+            return auuc
+
+        def fit(self, X, treatment=None, y=None, **kwargs):
+            super().fit(X[self.x_cols].values, X[self.treatment_col].values, X[self.y_col].values, **kwargs)
+
+    df, x_names = generate_classification_data_two_treatments()
+    train_data, val_data = train_test_split(df, test_size=0.2, random_state=RANDOM_SEED)
+
+    op = OptunaSearch(n_startup_trials=1, n_warmup_steps=1, n_trials=20)
+    tuning_param_dict = {'x_cols': x_names,
+                         'y_col': 'conversion',
+                         'treatment_col': 'treatment_group_key',
+                         'control_name': 'control',
+                         'max_depth': ('int', {'low': 2, 'high': 6}),
+                         'min_samples_leaf': ('int', {'low': 60, 'high': 100})
+                         }
+    op.search(Wrapper, tuning_param_dict, train_data, val_data)
+
+    train_param = op.get_params()
+    print(train_param)
+    a = Wrapper(**train_param[0])
+    a.fit(train_data)
+    print(a.score(val_data))
