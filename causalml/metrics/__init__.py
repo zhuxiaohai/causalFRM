@@ -24,6 +24,7 @@ from .visualize import (
     get_tmlegain,
     get_tmleqini,
     get_expected_outcome,
+    get_expected_outcome_pmg,
     get_modified_upliftcurve
 )  # noqa
 from .visualize import auuc_score, qini_score  # noqa

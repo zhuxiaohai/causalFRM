@@ -1034,6 +1034,7 @@ def get_modified_upliftcurve(df, outcome_col='y', treatment_col='w', propensity_
     df = df.sort_values(pred_effect_col, ascending=False).reset_index(drop=True)
     n_th = int(df.shape[0] / quantiles)
     modified_uplift = []
+    df['temp_assignment'] = df[pred_assignment]
     for i in range(quantiles):
         df.iloc[i * n_th:]['temp_assignment'] = control_name
         expected_outcome = get_expected_outcome(df, outcome_col, treatment_col, propensity_col, 'temp_assignment')
@@ -1046,12 +1047,11 @@ def get_modified_upliftcurve(df, outcome_col='y', treatment_col='w', propensity_
 
 
 def get_expected_outcome_pmg(df, outcome_col='y', treatment_col='w', pred_assignment='pred_assignment'):
-    df = df.copy()
     total_outcome = 0.0
     total_count = 0.0
     for treat in df.loc[df[pred_assignment] == df[treatment_col], pred_assignment].unique():
-        treat_mean = df[df[treatment_col] == treat, outcome_col].mean()
-        treat_count = df[df[pred_assignment] == treat].shape[0]
+        treat_mean = df.loc[df[treatment_col] == treat, outcome_col].mean()
+        treat_count = df.loc[df[pred_assignment] == treat].shape[0]
         total_outcome += treat_mean * treat_count
         total_count += treat_count
     return total_outcome / total_count
@@ -1059,5 +1059,5 @@ def get_expected_outcome_pmg(df, outcome_col='y', treatment_col='w', pred_assign
 
 def get_pmg(df, outcome_col='y', treatment_col='w', pred_assignment='pred_assignment', control_name='control'):
     expected_outcome = get_expected_outcome_pmg(df, outcome_col, treatment_col, pred_assignment)
-    expected_control_control_outcome = df[df[treatment_col] == control_name].mean()
-    return (expected_outcome - expected_control_control_outcome) / expected_control_control_outcome
+    expected_control_outcome = df.loc[df[treatment_col] == control_name, outcome_col].mean()
+    return (expected_outcome - expected_control_outcome) / expected_control_outcome

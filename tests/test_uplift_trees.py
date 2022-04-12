@@ -227,8 +227,11 @@ def test_UpliftForestClassifier_Optuna(generate_classification_data_two_treatmen
     op = OptunaSearch(n_startup_trials=1, n_warmup_steps=1, n_trials=20, optuna_njobs=1, coef_train_val_disparity=0.2)
     tuning_param_dict = {'control_name': 'control',
                          'random_state': 10,
-                         'max_depth': ('int', {'low': 2, 'high': 6}),
-                         'min_samples_leaf': ('int', {'low': 60, 'high': 100})
+                         'n_estimators': ('int', {'low': 5, 'high': 45, 'step': 10}),
+                         'max_depth': ('int', {'low': 2, 'high': 4}),
+                         'min_samples_leaf': ('int', {'low': 50, 'high': 150, 'step': 10}),
+                         'n_reg': ('int', {'low': 5, 'high': 30, 'step': 5}),
+                         'evaluationFunction': ('categorical', {'choices': ['KL', 'ED', 'Chi']})
                          }
     train_param = {'X': train_data[x_names].values,
                    'y': train_data['conversion'].values,
