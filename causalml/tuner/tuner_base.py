@@ -1,15 +1,16 @@
 import optuna
 import matplotlib.pyplot as plt
+from sklearn.base import clone
 
 
 class Objective(object):
-    def __init__(self, estimator, tuning_param_dict, train_data, val_data, coef_train_val_disparity, **fit_paramas):
+    def __init__(self, estimator, tuning_param_dict, coef_train_val_disparity,
+                 train_kargs, val_kargs):
         self.estimator = estimator
         self.tuning_param_dict = tuning_param_dict
-        self.train_data = train_data
-        self.val_data = val_data
         self.coef_train_val_disparity = coef_train_val_disparity
-        self.kwargs = fit_paramas
+        self.train_kargs = train_kargs
+        self.val_kargs = val_kargs
 
     def train_val_score(self, train_score, val_score, w):
         output_scores = val_score - abs(train_score - val_score) * w
@@ -37,12 +38,15 @@ class Objective(object):
                 trial_param_dict[key] = eval('trial.suggest_' + suggest_type)(key, **suggest_param)
             else:
                 trial_param_dict[key] = param
-        learner = self.estimator(**trial_param_dict)
-        learner.fit(X=self.train_data, **self.kwargs)
-        val_score = learner.score(X=self.val_data)
+        learner = clone(self.estimator, safe=False)
+        for key, value in trial_param_dict.items():
+            setattr(learner, key, value)
+        # learner = self.estimator(**trial_param_dict)
+        learner.fit(**self.train_kargs)
+        val_score = learner.score(**self.val_kargs)
         trial.set_user_attr("val_score", val_score)
         if self.coef_train_val_disparity > 0:
-            train_score = learner.score(X=self.train_data)
+            train_score = learner.score(**self.train_kargs)
             trial.set_user_attr("train_score", train_score)
             best_score = self.train_val_score(train_score, val_score, self.coef_train_val_disparity)
         else:
@@ -114,15 +118,14 @@ class OptunaSearch(object):
         if self.study:
             return optuna.visualization.plot_param_importances(self.study, params=names)
 
-    def search(self, estimator, params, train_data, val_data, **fit_kwargs):
+    def search(self, estimator, params, train_kargs, val_kargs):
         for key, param in params.items():
             if not isinstance(param, tuple):
                 self.static_params[key] = param
             else:
                 self.dynamic_params[key] = param
 
-        objective = Objective(estimator, params, train_data, val_data,
-                              self.coef_train_val_disparity, **fit_kwargs)
+        objective = Objective(estimator, params, self.coef_train_val_disparity, train_kargs, val_kargs)
 
         if self.optuna_verbosity == 0:
             optuna.logging.set_verbosity(optuna.logging.WARNING)

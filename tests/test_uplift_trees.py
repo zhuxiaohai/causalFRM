@@ -210,39 +210,36 @@ def test_UpliftTreeClassifier_feature_importance(generate_classification_data):
 
 def test_UpliftForestClassifier_Optuna(generate_classification_data_two_treatments):
     class Wrapper(UpliftRandomForestClassifier):
-        def __init__(self, x_cols, treatment_col, y_col, *args, **kargs):
-            super().__init__(*args, **kargs)
-            self.x_cols = x_cols
-            self.treatment_col = treatment_col
-            self.y_col = y_col
-
-        def score(self, X, y=None):
-            auuc = auuc_score(X[[self.y_col, self.treatment_col]].assign(
-                pred=self.predict(X[self.x_cols].values).max(axis=1),
-                if_treat=(X[self.treatment_col] != self.control_name).astype(int).values),
-                outcome_col=self.y_col,
+         def score(self, X, y, treatment):
+            auuc = auuc_score(pd.concat([pd.Series(y, name='y'),
+                                         pd.Series(treatment, name='treatment')],
+                                        axis=1).assign(
+                pred=self.predict(X).max(axis=1),
+                if_treat=(treatment != self.control_name).astype(int)),
+                outcome_col='y',
                 treatment_col='if_treat',
                 normalize=True).loc['pred']
             return auuc
 
-        def fit(self, X, treatment=None, y=None, **kwargs):
-            super().fit(X[self.x_cols].values, X[self.treatment_col].values, X[self.y_col].values, **kwargs)
-
     df, x_names = generate_classification_data_two_treatments()
     train_data, val_data = train_test_split(df, test_size=0.2, random_state=RANDOM_SEED)
 
-    op = OptunaSearch(n_startup_trials=1, n_warmup_steps=1, n_trials=20)
-    tuning_param_dict = {'x_cols': x_names,
-                         'y_col': 'conversion',
-                         'treatment_col': 'treatment_group_key',
-                         'control_name': 'control',
+    op = OptunaSearch(n_startup_trials=1, n_warmup_steps=1, n_trials=20, optuna_njobs=1, coef_train_val_disparity=0.2)
+    tuning_param_dict = {'control_name': 'control',
+                         'random_state': 10,
                          'max_depth': ('int', {'low': 2, 'high': 6}),
                          'min_samples_leaf': ('int', {'low': 60, 'high': 100})
                          }
-    op.search(Wrapper, tuning_param_dict, train_data, val_data)
+    train_param = {'X': train_data[x_names].values,
+                   'y': train_data['conversion'].values,
+                   'treatment': train_data['treatment_group_key'].values}
+    val_param = {'X': val_data[x_names].values,
+                 'y': val_data['conversion'].values,
+                 'treatment': val_data['treatment_group_key'].values}
+    op.search(Wrapper('d'), tuning_param_dict, train_param, val_param)
 
-    train_param = op.get_params()
-    print(train_param)
-    a = Wrapper(**train_param[0])
-    a.fit(train_data)
-    print(a.score(val_data))
+    opt_param = op.get_params()
+    print(opt_param)
+    a = Wrapper(**opt_param[0])
+    a.fit(**train_param)
+    print(a.score(**val_param))

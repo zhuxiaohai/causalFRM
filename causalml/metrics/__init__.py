@@ -23,6 +23,8 @@ from .visualize import (
     get_qini,
     get_tmlegain,
     get_tmleqini,
+    get_expected_outcome,
+    get_modified_upliftcurve
 )  # noqa
 from .visualize import auuc_score, qini_score  # noqa
 from .sensitivity import Sensitivity, SensitivityPlaceboTreatment  # noqa
